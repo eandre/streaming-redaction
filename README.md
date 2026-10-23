@@ -1,8 +1,9 @@
 # streaming-parse
 
-Streaming redaction of JSON and Protobuf payloads (including gRPC, gRPC-Web and Connect)
-for tokio. You give it a byte stream, a content type and a list of rules, and it produces a
-redacted version of the data as the bytes arrive. Memory use doesn't depend on payload size.
+Streaming redaction of JSON, Protobuf and HTML form payloads for tokio, including gRPC,
+gRPC-Web and Connect. You give it rules for each codec and a byte stream, optionally with
+its content type, and it produces a redacted version of the data as the bytes arrive.
+Memory use doesn't depend on payload size.
 
 It runs in one of two modes:
 
@@ -17,39 +18,38 @@ It runs in one of two modes:
 ```rust
 use streaming_parse::Redactor;
 
-// Compile the rules once per content type and reuse them. Redactor is Clone + Send + Sync.
-let redactor = Redactor::new("application/json", ["$..password", "$.cards[*].number"])?;
+// Rules for each codec. Build once and reuse: Redactor is Clone + Send + Sync.
+let redactor = Redactor::builder()
+    .json(["$..password", "$.cards[*].number"])
+    .proto(["2", "4.1"])
+    .form(["password"])
+    .build()?;
 
 // Tee: forward the original body, keep a redacted copy.
-let mut tee = redactor.tee(body);
+// The content type is optional; whatever it doesn't say is detected from the body.
+let mut tee = redactor.tee(body, Some("application/grpc-web-text"));
 tokio::io::copy(&mut tee, &mut upstream).await?;      // original bytes, unmodified
 let redacted: Vec<u8> = tee.into_redacted()?;
 
 // Stream: the reader yields redacted bytes.
-let mut redacted = redactor.reader(body);
+let mut redacted = redactor.reader(body, None);
 tokio::io::copy(&mut redacted, &mut sink).await?;
 ```
 
-For protobuf, rules are field numbers:
-
-```rust
-// Field 2, field 1 inside the message in field 4, and field 1 of every element of field 5.
-let redactor = Redactor::new("application/grpc", ["2", "4.1", "5.1"])?;
-```
-
-Two example programs read stdin:
+Two example programs read stdin. Rules are written `json:…`, `proto:…` or `form:…`, and
+`-t` sets the content type:
 
 ```sh
 # Redacted stream to stdout
-echo '{"user":{"password":"x"}}' | cargo run --example redact -- application/json '$..password'
+echo '{"user":{"password":"x"}}' | cargo run --example redact -- 'json:$..password'
 
 # Original to stdout, redacted copy to a file
-cargo run --example tee -- application/json redacted.json '$..password' < in.json > out.json
+cargo run --example tee -- -t application/grpc redacted.bin 'proto:2' < in.bin > out.bin
 ```
 
 ## Choosing a mode
 
-| | Tee: `redactor.tee(r)` | Stream: `redactor.reader(r)` |
+| | Tee: `redactor.tee(r, ct)` | Stream: `redactor.reader(r, ct)` |
 |---|---|---|
 | What you read | The original bytes, unmodified | The redacted bytes |
 | Where the redacted output goes | A separate buffer | The stream itself |
@@ -66,10 +66,11 @@ redacted fields be removed outright.
 
 ## Rules
 
-The rule syntax depends on how the messages are encoded, not on the transport. Use
-JSONPath for JSON (including `application/grpc+json`) and field-number paths for protobuf.
+Rules are written per codec, not per transport. JSONPath rules apply to plain JSON and to
+JSON inside gRPC or Connect frames alike. A codec without rules is still parsed, but
+nothing in it is redacted.
 
-### JSONPath
+### JSON: JSONPath
 
 A subset of [RFC 9535](https://www.rfc-editor.org/rfc/rfc9535):
 
@@ -89,7 +90,10 @@ the stream, such as the array length or a sibling member.
 Member names are compared after decoding escapes, so `{"pass\u0077ord": ...}` matches
 `$.password`.
 
-### Protobuf field paths
+For JSON-encoded protobuf (`application/grpc+json`, …), messages use the protobuf JSON
+mapping, so rules refer to JSON field names (`$.password`), not field numbers.
+
+### Protobuf: field paths
 
 Dot-separated field numbers, e.g. `4.3.1`: field 1 of the message in field 3 of the message
 in field 4.
@@ -103,27 +107,53 @@ in field 4.
 There's no schema involved, so the redactor can't tell a `string` from a `bytes` from a
 sub-message. That only matters in stream mode; see [Protobuf output](#protobuf).
 
-For the `+json` RPC codecs, messages use the protobuf JSON mapping, so rules refer to JSON
-field names (`$.password`). One rule set can't cover both codecs without a schema to map
-numbers to names.
+### Forms: field names
 
-## Content types
+Exact field names, e.g. `password`. They match urlencoded keys after percent-decoding
+(`pass%77ord` matches `password`) and the `name` of multipart parts.
 
-Parameters such as `; charset=utf-8` are ignored.
+## Content types and detection
 
-| Content type | `Format` |
-|---|---|
-| `application/json`, `text/json`, `*/*+json` | `Json` |
-| `application/x-ndjson`, `application/jsonl`, `application/jsonlines`, … | `JsonLines` (rules apply per document) |
-| `application/x-protobuf`, `application/protobuf`, `application/proto`, `*/*+proto` | `Protobuf` |
-| `application/grpc`, `application/grpc+proto`, `application/grpc+json` | `Grpc(codec)` |
-| `application/grpc-web`, `application/grpc-web+proto`, `…+json` | `GrpcWeb(codec)` |
-| `application/grpc-web-text`, `application/grpc-web-text+proto`, `…+json` | `GrpcWebText(codec)` |
-| `application/connect+proto`, `application/connect+json` | `ConnectStream(codec)` |
+Each payload can come with its `Content-Type`. Whatever the content type pins down is used
+as given. Whatever it leaves open, including when it's missing, is detected from the
+payload's first bytes.
 
-gRPC types without a suffix default to protobuf. Other codecs (`+thrift`, …) are rejected.
-Connect unary RPCs use plain `application/proto` and `application/json`. To skip
-content-type detection, use `Redactor::for_format(Format::Grpc(Codec::Json), rules, options)`.
+| Content type | Framing | Codec |
+|---|---|---|
+| `application/json`, `text/json`, `*/*+json`, NDJSON types | plain | JSON |
+| `application/x-protobuf`, `application/protobuf`, `application/proto`, `*/*+proto` | plain | protobuf |
+| `application/grpc`, `application/grpc-web`, `application/connect`, with optional `+proto`/`+json` | frames | from the suffix, otherwise detected |
+| `application/grpc-web-text`, with optional `+proto`/`+json` | base64 frames | from the suffix, otherwise detected |
+| `application/x-www-form-urlencoded` | urlencoded | form |
+| `multipart/form-data; boundary=…` | multipart | form |
+| `multipart/form-data` without a boundary | multipart (boundary detected) | form |
+| missing, or anything else | detected | detected |
+
+Parameters such as `; charset=utf-8` are ignored. NDJSON needs nothing special: several
+whitespace-separated JSON values are always accepted, and rules apply to each one.
+
+**Detecting the framing** relies on structure, not guesswork:
+
+* A gRPC/Connect frame starts with a flags byte (`0x00`–`0x02`, `0x80`). For protobuf those
+  bytes are a tag with field number 0, which is invalid, and no JSON or form body starts
+  with a control byte.
+* Base64 frames start with `A` or `g`, and must decode to a frame header with everything
+  after it being base64.
+* A multipart body starts with `--boundary` and a line break, which gives the boundary.
+
+**Detecting the codec** (when there's no frame and no content type, or a frame without a
+`+ext`) looks at the first 512 bytes, or the first message in a frame. Parsers are tried
+from strictest to loosest, and the first that accepts the bytes wins:
+
+1. **JSON.** Binary protobuf essentially never passes a strict JSON parser.
+2. **Form**, but only if every byte is one that form encoders leave unescaped and there's
+   an `=`. That excludes JSON, which always contains `"`, `{` or `:`. It also excludes
+   practically all protobuf, which has bytes below `0x21` (tags of fields 1–3, short
+   lengths, small numbers).
+3. **Protobuf.** Text often parses as protobuf for a while, so it goes last.
+
+If nothing accepts the payload, the result is `Error::UnrecognizedPayload`. This is a
+heuristic, so pass the content type whenever you have it.
 
 ## Output
 
@@ -166,19 +196,29 @@ What a length-delimited field is overwritten with is set by `Options::proto_fill
 
 Fields of 1–3 bytes are always zero-filled, since no non-empty message is that short.
 
-### RPC envelopes
+### Forms
+
+* **Urlencoded:** the value of each matching key is replaced with `[REDACTED]`
+  (percent-encoded: `%5BREDACTED%5D`), or whatever `Options::form_replacement` is set to.
+* **Multipart:** the body of each matching part is replaced, including file uploads.
+  Part headers, the preamble and the epilogue are copied through.
+* Neither format has length prefixes, so both modes produce the same output.
+
+### RPC frames
 
 gRPC, gRPC-Web and Connect wrap each message in a 5-byte header: a flags byte and a 4-byte
-length.
+length. One parser handles all three.
 
 * Each message is redacted on its own. In tee mode its length is fixed once it ends;
   in stream mode the redacted message has the same size, so the header is copied as is.
-* gRPC-Web trailer frames and Connect end-of-stream frames are passed through untouched.
+* gRPC-Web trailer frames (`0x80`) and Connect end-of-stream frames (`0x02`) are copied
+  through untouched. Plain gRPC reserves those bits, so a gRPC peer rejects such frames anyway.
 * Compressed messages (`grpc-encoding: gzip`, …) can't be read and produce
   `Error::CompressedGrpcMessage`.
 * `grpc-web-text` is base64-decoded, redacted and re-encoded on the fly. Servers may
   encode each flush separately, so `=` padding can appear mid-stream.
-  * Stream mode keeps the padding in the same places.
+  * Stream mode keeps the padding in the same places when the codec is known. When it's
+    detected, the first message is held until it's decided, which shifts padding there.
   * Tee mode writes one continuous base64 stream.
 
 ## Memory and latency
@@ -189,39 +229,47 @@ No mode ever buffers a whole value, field or message of the input. What each par
 |---|---|
 | `RedactReader` (stream mode) | One 8 KiB read chunk, plus the output from it |
 | `TeeReader` | Nothing for the original stream: it reads straight into your buffer |
+| Detection | Up to 512 bytes, only while the codec is being detected (see below) |
 | JSON parser | A few bytes per nesting level, plus the current key (cut off once longer than the longest name in the rules) |
 | Protobuf parser | A partial tag or length (≤ 10 bytes), plus one entry per sub-message a rule reaches into |
+| Form parsers | The current urlencoded key / part headers (capped at 16 KiB), plus up to a boundary's length while checking for a delimiter |
 | RPC frames / base64 | The 5-byte header / a few bytes of base64 |
 
 Nesting is capped by `Options::max_depth` (default 256) so hostile input can't grow
 the parser state.
 
-In stream mode, output keeps pace with input. The only things held back are one byte
-inside a same-length JSON value, because its closing `"` can only be written once the value
-ends, and up to 3 characters of base64.
+In stream mode, output keeps pace with input, apart from a few bytes:
+
+* the start of the payload while its codec is detected: up to 512 bytes, or up to the
+  first message in a frame. A content type that names the codec avoids this.
+* one byte inside a same-length JSON value, because its closing `"` can only be written
+  once the value ends;
+* up to 3 characters of base64, or a boundary's length in a multipart part.
 
 In tee mode, the redacted copy can't be final where a length may still change. Call
 `tee.take_redacted_ready()` (or `RedactedCopy::take_ready`) to take the part that is final,
 and ship it as you go. What stays behind:
 
-* JSON: nothing.
-* RPC envelopes: the current message.
+* JSON and forms: nothing.
+* RPC frames: the current message.
 * Protobuf: the outermost open sub-message that a rule reaches into. Sub-messages no rule
   touches are copied straight through.
 
 If you only call `into_redacted()` at the end, the whole copy is held. There's no size
 cap built in.
 
-Measured on a 199 MB JSON file (release build, macOS laptop):
+Measured on a 199 MB JSON file (release build, macOS laptop), with rules for all three
+codecs:
 
 | | Time | Peak memory (whole process) |
 |---|---|---|
-| `redact` example (stream) | ~1.0 s | ~3 MB |
+| `redact` example, content type given | ~0.5 s | ~3 MB |
+| `redact` example, codec detected | ~0.65 s | ~3 MB |
 | `tee` example, taking ready output as it goes | ~0.6 s | ~5 MB |
 
 ## Errors
 
-`Error` covers bad rules, unsupported content types, malformed or truncated input, the depth
+`Error` covers bad rules, unrecognized payloads, malformed or truncated input, the depth
 limit and compressed gRPC messages.
 
 * **Stream mode:** the redact decision for each byte is made before the byte is written, so
@@ -236,32 +284,33 @@ limit and compressed gRPC messages.
 
 | Item | Purpose |
 |---|---|
-| `Redactor::new(content_type, rules)` | Build from a content type and rule strings |
-| `Redactor::with_options(…, Options)` | Same, with options |
-| `Redactor::for_format(format, rules, options)` | Explicit format instead of content type |
-| `Redactor::json(format, Vec<JsonPath>, …)` / `protobuf(format, Vec<FieldPath>, …)` | Pre-parsed rules |
-| `redactor.tee(r) -> TeeReader<R>` | Original bytes out; `take_redacted_ready()`, `into_redacted()`, `into_parts()`, `redaction_error()` |
-| `redactor.reader(r) -> RedactReader<R>` | Redacted bytes out |
-| `redactor.redact(r, &mut w).await` | Copy redacted bytes to a writer |
-| `redactor.redacted_copy() -> RedactedCopy` | Tee mode without tokio: `feed(&[u8])`, `take_ready()`, `finish()` |
-| `redactor.stream() -> StreamRedactor` | Stream mode without tokio: `feed(&[u8], &mut Vec<u8>)`, `finish(&mut Vec<u8>)` |
-| `Options` | `json_replacement`, `preserve_json_size`, `proto_fill`, `max_depth` |
-| `Format`, `Codec` | Wire format; `Format::from_content_type` |
+| `Redactor::builder()` | `.json(rules)`, `.proto(rules)`, `.form(rules)`, `.options(Options)`, `.build()` |
+| `redactor.tee(r, ct) -> TeeReader<R>` | Original bytes out; `take_redacted_ready()`, `into_redacted()`, `into_parts()`, `redaction_error()` |
+| `redactor.reader(r, ct) -> RedactReader<R>` | Redacted bytes out |
+| `redactor.redact(r, &mut w, ct).await` | Copy redacted bytes to a writer |
+| `redactor.redacted_copy(ct) -> RedactedCopy` | Tee mode without tokio: `feed(&[u8])`, `take_ready()`, `finish()` |
+| `redactor.stream(ct) -> StreamRedactor` | Stream mode without tokio: `feed(&[u8], &mut Vec<u8>)`, `finish(&mut Vec<u8>)` |
+| `Options` | `json_replacement`, `preserve_json_size`, `form_replacement`, `proto_fill`, `max_depth` |
+| `JsonPath`, `FieldPath` | Parse and validate a single rule |
 
-Output never depends on how the input is split into chunks.
+`ct` is the payload's content type as an `Option<&str>`. Output never depends on how the
+input is split into chunks.
 
 ## Limitations
 
-* No JSONPath filters, slices or negative indices (see [Rules](#jsonpath)).
+* No JSONPath filters, slices or negative indices (see [Rules](#json-jsonpath)).
 * No schema: protobuf rules use field numbers, and JSON-encoded protobuf needs separate
   JSONPath rules.
+* Codec detection without a content type is a heuristic (see
+  [Content types and detection](#content-types-and-detection)).
 * Compressed gRPC/Connect messages are rejected rather than decompressed.
+* Form rules are exact names; nested JSON inside a multipart part isn't redacted by JSON rules.
 * No built-in size cap for the redacted copy in tee mode.
 
 ## Development
 
 ```sh
-cargo test     # 54 tests
+cargo test     # 70 tests
 cargo clippy --all-targets
 ```
 
@@ -269,9 +318,12 @@ The tests include:
 
 * A randomized comparison of the JSON redactor against a separate, simple tree-based
   implementation (5,000 documents × rule sets × random chunk sizes, in both normal and
-  same-length mode).
+  same-length mode, with the codec detected in half the cases).
 * Protobuf output decoded with `prost`. In tee mode it's compared byte for byte with
   `prost`'s own encoding of the expected message (500 random cases).
-* Every RPC protocol with both codecs, including base64 padding at awkward positions.
+* Every format through one redactor with a full, partial or missing content type, in both
+  modes, fed one byte at a time.
+* 3,000 random protobuf messages with JSON- and form-like strings, and random forms, all
+  detected without a content type.
 
 Dependencies: `tokio` (only the `io-util` feature) and `pin-project-lite`.

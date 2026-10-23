@@ -1,5 +1,7 @@
 //! Length-prefixed message envelopes: `[flags:u8][len:u32 BE][message]`,
-//! repeated. Used by gRPC, gRPC-Web and Connect streaming.
+//! repeated. Used by gRPC, gRPC-Web and Connect streaming, which differ only
+//! in which flag marks a metadata frame (gRPC-Web trailers: `0x80`, Connect
+//! end-of-stream: `0x02`; plain gRPC has none). One parser handles all three.
 //!
 //! Each message is redacted with a fresh message engine.
 //!
@@ -10,19 +12,55 @@
 //! In resize mode the header is written with a placeholder length that is
 //! patched once the message ends, so redacted messages may change size.
 
-use crate::{Error, json, proto};
+use crate::detect::{self, WINDOW};
+use crate::{Codec, Compiled, Error, json, proto};
 
 /// The per-message redactor.
 pub(crate) enum Msg {
     Proto(proto::Engine),
     Json(json::Engine),
+    /// Codec not known from the content type: decided from the first
+    /// non-empty message, then used for the rest of the stream.
+    Detect(Box<DetectMsg>),
+}
+
+pub(crate) struct DetectMsg {
+    compiled: Compiled,
+    resize: bool,
+    /// Length of the current message.
+    len: u32,
+    pending: Vec<u8>,
+    chosen: Option<Msg>,
 }
 
 impl Msg {
-    fn reset(&mut self) {
+    pub(crate) fn new(c: &Compiled, codec: Option<Codec>, resize: bool) -> Msg {
+        match codec {
+            // Without patching, frame lengths force same-size JSON.
+            Some(Codec::Json) => Msg::Json(json::Engine::new(c.json.clone(), !resize)),
+            Some(Codec::Proto) => Msg::Proto(proto::Engine::new(c.proto.clone(), resize)),
+            Some(Codec::Form) | None => Msg::Detect(Box::new(DetectMsg {
+                compiled: c.clone(),
+                resize,
+                len: 0,
+                pending: Vec::new(),
+                chosen: None,
+            })),
+        }
+    }
+
+    /// Prepares for a new message of `len` bytes.
+    fn begin(&mut self, len: u32) {
         match self {
             Msg::Proto(e) => e.reset(),
             Msg::Json(e) => e.reset(),
+            Msg::Detect(d) => match &mut d.chosen {
+                Some(m) => m.begin(len),
+                None => {
+                    d.len = len;
+                    d.pending.clear();
+                }
+            },
         }
     }
 
@@ -30,6 +68,10 @@ impl Msg {
         match self {
             Msg::Proto(e) => e.position(),
             Msg::Json(e) => e.position(),
+            Msg::Detect(d) => match &d.chosen {
+                Some(m) => m.position(),
+                None => d.pending.len() as u64,
+            },
         }
     }
 
@@ -37,6 +79,29 @@ impl Msg {
         match self {
             Msg::Proto(e) => e.feed(input, out),
             Msg::Json(e) => e.feed(input, out),
+            Msg::Detect(d) => {
+                if let Some(m) = &mut d.chosen {
+                    return m.feed(input, out);
+                }
+                d.pending.extend_from_slice(input);
+                // Decide once we have the whole message or a full window.
+                let complete = d.pending.len() == d.len as usize;
+                if !complete && d.pending.len() < WINDOW {
+                    return Ok(());
+                }
+                let (codec, _) = detect::choose(
+                    &d.compiled,
+                    &[Codec::Json, Codec::Proto],
+                    &d.pending,
+                    complete,
+                )?;
+                let mut m = Msg::new(&d.compiled, codec, d.resize);
+                m.begin(d.len);
+                let pending = std::mem::take(&mut d.pending);
+                m.feed(&pending, out)?;
+                d.chosen = Some(m);
+                Ok(())
+            }
         }
     }
 
@@ -44,6 +109,11 @@ impl Msg {
         match self {
             Msg::Proto(e) => e.finish(out),
             Msg::Json(e) => e.finish(out),
+            Msg::Detect(d) => match &mut d.chosen {
+                Some(m) => m.finish(out),
+                // Only empty messages so far: nothing to parse.
+                None => Ok(()),
+            },
         }
     }
 
@@ -51,40 +121,31 @@ impl Msg {
         match self {
             Msg::Proto(e) => e.committed(out_len),
             Msg::Json(_) => out_len,
+            Msg::Detect(d) => d.chosen.as_ref().map_or(out_len, |m| m.committed(out_len)),
         }
     }
 
     fn shift(&mut self, k: usize) {
-        if let Msg::Proto(e) = self {
-            e.shift(k);
+        match self {
+            Msg::Proto(e) => e.shift(k),
+            Msg::Json(_) => {}
+            Msg::Detect(d) => {
+                if let Some(m) = &mut d.chosen {
+                    m.shift(k);
+                }
+            }
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Protocol {
-    Grpc,
-    GrpcWeb,
-    Connect,
 }
 
 const COMPRESSED: u8 = 0x01;
-
-impl Protocol {
-    /// Flag marking frames that carry protocol metadata rather than a
-    /// message (gRPC-Web trailers, Connect end-of-stream). These are passed
-    /// through untouched.
-    fn metadata_flag(self) -> u8 {
-        match self {
-            Protocol::Grpc => 0,
-            Protocol::GrpcWeb => 0x80,
-            Protocol::Connect => 0x02,
-        }
-    }
-}
+/// Frames carrying protocol metadata rather than a message: gRPC-Web
+/// trailers (`0x80`) and Connect end-of-stream (`0x02`). Passed through
+/// untouched. Plain gRPC reserves these bits, so a gRPC peer would reject
+/// such a frame anyway.
+const METADATA: u8 = 0x80 | 0x02;
 
 pub(crate) struct Engine {
-    protocol: Protocol,
     inner: Msg,
     /// Resize mode: patch each message's length after it ends.
     resize: bool,
@@ -103,9 +164,8 @@ enum State {
 }
 
 impl Engine {
-    pub(crate) fn new(protocol: Protocol, inner: Msg, resize: bool) -> Self {
+    pub(crate) fn new(inner: Msg, resize: bool) -> Self {
         Engine {
-            protocol,
             inner,
             resize,
             header_pos: None,
@@ -137,15 +197,16 @@ impl Engine {
                     }
                     let flags = self.header[0];
                     let len = u32::from_be_bytes(self.header[1..5].try_into().unwrap());
-                    let meta = self.protocol.metadata_flag();
-                    if meta != 0 && flags & meta != 0 {
+                    if flags & METADATA != 0 {
+                        // Copied as is, so there's no length to patch.
+                        self.header_pos = None;
                         self.state = State::Metadata { left: len };
                     } else if flags & COMPRESSED != 0 {
                         return Err(Error::CompressedGrpcMessage {
                             offset: self.offset - 5,
                         });
                     } else {
-                        self.inner.reset();
+                        self.inner.begin(len);
                         self.state = State::Message { left: len };
                     }
                     self.end_frame_if_complete(out)?;

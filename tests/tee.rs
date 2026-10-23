@@ -112,8 +112,8 @@ const RULES: [(&str, Edit); 9] = [
 ];
 
 /// Feeds `input` in random chunks, taking ready output along the way.
-fn copy_chunked(r: &Redactor, input: &[u8], rng: &mut Rng) -> Result<Vec<u8>, Error> {
-    let mut c = r.redacted_copy();
+fn copy_chunked(r: &Redactor, ct: &str, input: &[u8], rng: &mut Rng) -> Result<Vec<u8>, Error> {
+    let mut c = r.redacted_copy(Some(ct));
     let mut out = Vec::new();
     let mut rest = input;
     while !rest.is_empty() {
@@ -141,8 +141,14 @@ fn protobuf_fields_are_removed() {
             edit(&mut expected);
         }
 
-        let r = Redactor::new("application/x-protobuf", &rules).unwrap();
-        let got = copy_chunked(&r, &user.encode_to_vec(), &mut rng).unwrap();
+        let r = Redactor::builder().proto(&rules).build().unwrap();
+        let got = copy_chunked(
+            &r,
+            "application/x-protobuf",
+            &user.encode_to_vec(),
+            &mut rng,
+        )
+        .unwrap();
         // Removing fields gives exactly what prost encodes for the edited
         // message, including minimal length prefixes.
         assert_eq!(
@@ -158,9 +164,11 @@ fn protobuf_groups_are_removed() {
     // field 1 = group { field 2 = varint 150 }, field 3 = varint 1
     let input = [0x0B, 0x10, 0x96, 0x01, 0x0C, 0x18, 0x01];
     let run = |rules: &[&str]| {
-        let mut c = Redactor::new("application/x-protobuf", rules)
+        let mut c = Redactor::builder()
+            .proto(rules)
+            .build()
             .unwrap()
-            .redacted_copy();
+            .redacted_copy(Some("application/x-protobuf"));
         c.feed(&input).unwrap();
         c.finish().unwrap()
     };
@@ -172,9 +180,11 @@ fn protobuf_groups_are_removed() {
     let input = [0x0A, 0x04, 0x13, 0x18, 0x05, 0x14];
     assert_eq!(
         {
-            let mut c = Redactor::new("application/x-protobuf", ["1.2.3"])
+            let mut c = Redactor::builder()
+                .proto(["1.2.3"])
+                .build()
                 .unwrap()
-                .redacted_copy();
+                .redacted_copy(Some("application/x-protobuf"));
             c.feed(&input).unwrap();
             c.finish().unwrap()
         },
@@ -208,8 +218,8 @@ fn grpc_frames_are_resized() {
         .iter()
         .flat_map(|u| frame(&u.encode_to_vec()))
         .collect();
-    let r = Redactor::new("application/grpc", ["2", "4"]).unwrap();
-    let out = copy_chunked(&r, &body, &mut rng).unwrap();
+    let r = Redactor::builder().proto(["2", "4"]).build().unwrap();
+    let out = copy_chunked(&r, "application/grpc", &body, &mut rng).unwrap();
     let got: Vec<User> = frames(&out)
         .into_iter()
         .map(|m| User::decode(m).unwrap())
@@ -235,8 +245,8 @@ fn grpc_json_uses_normal_replacement() {
         .iter()
         .flat_map(|m| frame(m.to_string().as_bytes()))
         .collect();
-    let r = Redactor::new("application/grpc-web+json", ["$.password"]).unwrap();
-    let out = copy_chunked(&r, &body, &mut Rng(3)).unwrap();
+    let r = Redactor::builder().json(["$.password"]).build().unwrap();
+    let out = copy_chunked(&r, "application/grpc-web+json", &body, &mut Rng(3)).unwrap();
     let got: Vec<Value> = frames(&out)
         .into_iter()
         .map(|m| serde_json::from_slice(m).unwrap())
@@ -293,8 +303,14 @@ fn grpc_web_text_is_resized_and_reencoded() {
         .iter()
         .map(|u| b64(&frame(&u.encode_to_vec())))
         .collect();
-    let r = Redactor::new("application/grpc-web-text", ["2"]).unwrap();
-    let out = copy_chunked(&r, text.as_bytes(), &mut Rng(11)).unwrap();
+    let r = Redactor::builder().proto(["2"]).build().unwrap();
+    let out = copy_chunked(
+        &r,
+        "application/grpc-web-text",
+        text.as_bytes(),
+        &mut Rng(11),
+    )
+    .unwrap();
 
     let expected: Vec<u8> = users
         .iter()
@@ -314,7 +330,7 @@ fn grpc_web_text_is_resized_and_reencoded() {
 
 #[test]
 fn take_ready_holds_back_only_what_can_change() {
-    let r = Redactor::new("application/grpc", ["2"]).unwrap();
+    let r = Redactor::builder().proto(["2"]).build().unwrap();
     let msg = User {
         name: "ann".into(),
         password: "hunter2".into(),
@@ -322,7 +338,7 @@ fn take_ready_holds_back_only_what_can_change() {
     }
     .encode_to_vec();
     let f = frame(&msg);
-    let mut c = r.redacted_copy();
+    let mut c = r.redacted_copy(Some("application/grpc"));
     c.feed(&f[..f.len() - 1]).unwrap();
     // The frame's length isn't known until the message ends.
     assert!(c.take_ready().is_empty());
@@ -332,9 +348,11 @@ fn take_ready_holds_back_only_what_can_change() {
     assert_eq!(c.buffered_len(), 0);
 
     // JSON never holds anything back.
-    let mut c = Redactor::new("application/json", ["$.pw"])
+    let mut c = Redactor::builder()
+        .json(["$.pw"])
+        .build()
         .unwrap()
-        .redacted_copy();
+        .redacted_copy(Some("application/json"));
     c.feed(br#"{"pw": "x", "ok": [1, "#).unwrap();
     assert_eq!(c.take_ready(), br#"{"pw": "[REDACTED]", "ok": [1, "#);
 }
@@ -342,8 +360,8 @@ fn take_ready_holds_back_only_what_can_change() {
 #[tokio::test]
 async fn tee_passes_original_through() {
     let input = br#"{"user": "ann", "password": "hunter2", "nested": {"password": "x"}}"#;
-    let r = Redactor::new("application/json", ["$..password"]).unwrap();
-    let mut tee = r.tee(&input[..]);
+    let r = Redactor::builder().json(["$..password"]).build().unwrap();
+    let mut tee = r.tee(&input[..], Some("application/json"));
     let mut original = Vec::new();
     tee.read_to_end(&mut original).await.unwrap();
     assert_eq!(original, input);
@@ -356,8 +374,8 @@ async fn tee_passes_original_through() {
 #[tokio::test]
 async fn tee_redaction_errors_dont_affect_original() {
     let input = br#"{"password": "hunter2" garbage"#;
-    let r = Redactor::new("application/json", ["$.password"]).unwrap();
-    let mut tee = r.tee(&input[..]);
+    let r = Redactor::builder().json(["$.password"]).build().unwrap();
+    let mut tee = r.tee(&input[..], Some("application/json"));
     let mut original = Vec::new();
     tee.read_to_end(&mut original).await.unwrap();
     assert_eq!(original, input);
@@ -375,8 +393,8 @@ async fn tee_requires_reading_to_the_end() {
         ..Default::default()
     }
     .encode_to_vec();
-    let r = Redactor::new("application/x-protobuf", ["2"]).unwrap();
-    let mut tee = r.tee(&msg[..]);
+    let r = Redactor::builder().proto(["2"]).build().unwrap();
+    let mut tee = r.tee(&msg[..], Some("application/x-protobuf"));
     let mut first = [0u8; 5];
     tee.read_exact(&mut first).await.unwrap();
     assert!(matches!(

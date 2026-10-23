@@ -1,52 +1,49 @@
-//! Streaming, constant-memory redaction of JSON and Protobuf payloads.
+//! Streaming redaction of JSON, Protobuf and HTML form payloads.
 //!
-//! A [`Redactor`] is built from a content type and a list of rules. The rule
-//! syntax follows the message encoding ([`Codec`]):
+//! A [`Redactor`] holds redaction rules for each codec:
 //!
-//! * JSON (`application/json`, `*+json`, NDJSON, `application/grpc+json`, …):
-//!   rules are JSONPath expressions such as `$.user.password`, `$..token` or
+//! * JSON: JSONPath expressions such as `$.user.password`, `$..token` or
 //!   `$.items[*].card`.
-//! * Protobuf (`application/x-protobuf`, `application/grpc`, …): rules are
-//!   field masks written as field numbers, such as `1.3.2` (field 2 of the
-//!   message in field 3 of the message in field 1).
+//! * Protobuf: field-number paths such as `1.3.2` (field 2 of the message in
+//!   field 3 of the message in field 1).
+//! * Forms: field names, for urlencoded and multipart bodies.
 //!
-//! gRPC, gRPC-Web (binary and base64 `-text`) and Connect streaming envelopes
-//! are understood, with either codec.
+//! Each payload is redacted with an optional content type. Whatever the
+//! content type leaves open (or all of it, if there is none) is detected from
+//! the payload's first bytes: plain JSON or NDJSON, a bare protobuf message,
+//! gRPC / gRPC-Web / Connect frames (binary or base64 `grpc-web-text`) with
+//! either codec inside, or a urlencoded / multipart form.
 //!
-//! The input is processed as it arrives. Nothing is buffered beyond the
-//! current read chunk plus O(nesting depth) parser state, and the redaction
-//! decision for every byte is made before that byte is emitted, so partially
-//! written output never leaks redacted data.
-//!
-//! ```no_run
-//! # async fn demo(body: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<()> {
-//! use streaming_parse::Redactor;
-//!
-//! let redactor = Redactor::new("application/json", ["$.password", "$..ssn"])?;
-//! let mut redacted = redactor.reader(body); // implements AsyncRead
-//! tokio::io::copy(&mut redacted, &mut tokio::io::stdout()).await?;
-//! # Ok(()) }
-//! ```
-//!
-//! To forward the original bytes untouched and keep a redacted copy on the
-//! side (e.g. for tracing), use [`Redactor::tee`]. Because that copy is
-//! buffered, redaction there may change sizes: protobuf fields are removed
-//! and length prefixes rewritten.
+//! The input is processed as it arrives, with memory independent of payload
+//! size, and the redaction decision for every byte is made before that byte
+//! is emitted, so partially written output never leaks redacted data.
 //!
 //! ```no_run
 //! # async fn demo(body: impl tokio::io::AsyncRead + Unpin, mut upstream: impl tokio::io::AsyncWrite + Unpin) -> Result<(), Box<dyn std::error::Error>> {
-//! # let redactor = streaming_parse::Redactor::new("application/grpc", ["2"])?;
-//! let mut tee = redactor.tee(body);
-//! tokio::io::copy(&mut tee, &mut upstream).await?; // original bytes
+//! use streaming_parse::Redactor;
+//!
+//! let redactor = Redactor::builder()
+//!     .json(["$..password"])
+//!     .proto(["2", "4.1"])
+//!     .form(["password"])
+//!     .build()?;
+//!
+//! // Forward the original bytes and keep a redacted copy, e.g. for tracing.
+//! let mut tee = redactor.tee(body, Some("application/grpc-web-text"));
+//! tokio::io::copy(&mut tee, &mut upstream).await?;
 //! let redacted: Vec<u8> = tee.into_redacted()?;
 //! # Ok(()) }
 //! ```
 //!
-//! See the README for the exact output semantics of each format.
+//! [`Redactor::reader`] instead redacts the stream itself, keeping sizes
+//! unchanged where length prefixes require it. See the README for the exact
+//! output semantics of each format.
 
 mod base64;
+mod detect;
 mod envelope;
 mod error;
+mod form;
 mod json;
 mod proto;
 mod reader;
@@ -60,116 +57,19 @@ pub use proto::{FieldPath, ProtoFill};
 pub use reader::RedactReader;
 pub use tee::TeeReader;
 
+use detect::Auto;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-/// How individual messages are encoded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Codec {
-    /// Binary protobuf; rules are field-number paths ([`FieldPath`]).
-    Proto,
-    /// JSON (for RPC protocols: the protobuf JSON mapping); rules are
-    /// JSONPath ([`JsonPath`]).
-    Json,
-}
-
-/// Wire format of the payload, usually derived from a content type.
+/// How a payload's messages are encoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Format {
-    /// A single JSON value.
+pub enum Codec {
+    /// JSON, including NDJSON and the protobuf JSON mapping in gRPC frames.
     Json,
-    /// A sequence of whitespace-separated JSON values (NDJSON / JSON Lines).
-    JsonLines,
-    /// A single binary protobuf message.
-    Protobuf,
-    /// A gRPC body: a sequence of length-prefixed messages.
-    Grpc(Codec),
-    /// A binary gRPC-Web body: like gRPC, plus a trailer frame which is
-    /// passed through untouched.
-    GrpcWeb(Codec),
-    /// A gRPC-Web body, base64-encoded (`application/grpc-web-text`).
-    GrpcWebText(Codec),
-    /// A Connect streaming body (`application/connect+proto`/`+json`). The
-    /// end-of-stream frame is passed through untouched. Connect unary RPCs
-    /// use plain `application/proto` / `application/json`.
-    ConnectStream(Codec),
-}
-
-impl Format {
-    /// Maps a `Content-Type` header value to a format. Parameters such as
-    /// `; charset=utf-8` are ignored. Returns `None` if unsupported.
-    pub fn from_content_type(content_type: &str) -> Option<Format> {
-        let essence = content_type
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
-
-        // Enveloped RPC protocols: `<base>[+<codec>]`.
-        let (base, suffix) = match essence.split_once('+') {
-            Some((b, s)) => (b, Some(s)),
-            None => (essence.as_str(), None),
-        };
-        let envelope: Option<fn(Codec) -> Format> = match base {
-            "application/grpc" => Some(Format::Grpc),
-            "application/grpc-web" => Some(Format::GrpcWeb),
-            "application/grpc-web-text" => Some(Format::GrpcWebText),
-            "application/connect" => Some(Format::ConnectStream),
-            _ => None,
-        };
-        if let Some(make) = envelope {
-            let codec = match suffix {
-                // gRPC defaults to protobuf; Connect always names the codec.
-                None if base != "application/connect" => Codec::Proto,
-                Some("proto" | "protobuf") => Codec::Proto,
-                Some("json") => Codec::Json,
-                _ => return None,
-            };
-            return Some(make(codec));
-        }
-
-        let f = match essence.as_str() {
-            "application/json" | "text/json" => Format::Json,
-            "application/x-ndjson"
-            | "application/ndjson"
-            | "application/jsonl"
-            | "application/x-jsonlines"
-            | "application/jsonlines"
-            | "application/json-lines" => Format::JsonLines,
-            "application/x-protobuf"
-            | "application/protobuf"
-            | "application/proto"
-            | "application/x-google-protobuf"
-            | "application/vnd.google.protobuf" => Format::Protobuf,
-            s if s.ends_with("+json") => Format::Json,
-            s if s.ends_with("+protobuf") || s.ends_with("+proto") => Format::Protobuf,
-            _ => return None,
-        };
-        Some(f)
-    }
-
-    /// The message encoding, which determines the rule syntax.
-    pub fn codec(self) -> Codec {
-        match self {
-            Format::Json | Format::JsonLines => Codec::Json,
-            Format::Protobuf => Codec::Proto,
-            Format::Grpc(c)
-            | Format::GrpcWeb(c)
-            | Format::GrpcWebText(c)
-            | Format::ConnectStream(c) => c,
-        }
-    }
-
-    /// The envelope protocol, if messages are length-prefixed.
-    fn envelope(self) -> Option<envelope::Protocol> {
-        match self {
-            Format::Grpc(_) => Some(envelope::Protocol::Grpc),
-            Format::GrpcWeb(_) | Format::GrpcWebText(_) => Some(envelope::Protocol::GrpcWeb),
-            Format::ConnectStream(_) => Some(envelope::Protocol::Connect),
-            _ => None,
-        }
-    }
+    /// Binary protobuf.
+    Proto,
+    /// HTML forms: urlencoded or multipart.
+    Form,
 }
 
 /// Tuning knobs. Construct with [`Options::default`] and the builder methods.
@@ -183,9 +83,12 @@ pub struct Options {
     /// Replace each redacted JSON value with a string of `*` of exactly the
     /// same byte length (single-digit numbers become `0`), so the output is
     /// as long as the input. Useful when a `Content-Length` must stay valid.
-    /// Always on for JSON inside gRPC/Connect envelopes, whose length
-    /// prefixes are written before the message. Default: false.
+    /// In stream mode it's always on for JSON inside gRPC/Connect frames,
+    /// whose length prefixes are written before the message. Default: false.
     pub preserve_json_size: bool,
+    /// Text written in place of each redacted form field value (encoded as
+    /// needed). Default: `[REDACTED]`.
+    pub form_replacement: String,
     /// What redacted length-delimited protobuf fields are filled with.
     pub proto_fill: ProtoFill,
     /// Maximum nesting depth of the input. Bounds memory use on hostile
@@ -198,6 +101,7 @@ impl Default for Options {
         Options {
             json_replacement: "\"[REDACTED]\"".to_owned(),
             preserve_json_size: false,
+            form_replacement: "[REDACTED]".to_owned(),
             proto_fill: ProtoFill::default(),
             max_depth: 256,
         }
@@ -217,6 +121,12 @@ impl Options {
         self
     }
 
+    /// Sets the text used in place of redacted form field values.
+    pub fn form_replacement(mut self, text: impl Into<String>) -> Self {
+        self.form_replacement = text.into();
+        self
+    }
+
     /// Sets the fill strategy for redacted length-delimited protobuf fields.
     pub fn proto_fill(mut self, fill: ProtoFill) -> Self {
         self.proto_fill = fill;
@@ -230,191 +140,166 @@ impl Options {
     }
 }
 
+/// Rules for every codec, compiled.
 #[derive(Clone)]
-enum Compiled {
-    Json(Arc<json::Compiled>),
-    Proto(Arc<proto::Compiled>),
+pub(crate) struct Compiled {
+    json: Arc<json::Compiled>,
+    proto: Arc<proto::Compiled>,
+    form: Arc<form::Compiled>,
 }
 
-/// A compiled set of redaction rules for one format.
+/// Builds a [`Redactor`]. Codecs without rules are still parsed (and
+/// validated) but nothing in them is redacted.
+#[derive(Debug, Clone, Default)]
+pub struct RedactorBuilder {
+    json: Vec<String>,
+    proto: Vec<String>,
+    form: Vec<String>,
+    options: Options,
+}
+
+impl RedactorBuilder {
+    /// Adds JSONPath rules, e.g. `$..password`, `$.cards[*].number`.
+    pub fn json<I, S>(mut self, rules: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.json
+            .extend(rules.into_iter().map(|r| r.as_ref().to_owned()));
+        self
+    }
+
+    /// Adds protobuf field-number paths, e.g. `2`, `4.1`.
+    pub fn proto<I, S>(mut self, rules: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.proto
+            .extend(rules.into_iter().map(|r| r.as_ref().to_owned()));
+        self
+    }
+
+    /// Adds form field names, e.g. `password`.
+    pub fn form<I, S>(mut self, rules: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.form
+            .extend(rules.into_iter().map(|r| r.as_ref().to_owned()));
+        self
+    }
+
+    /// Sets the options.
+    pub fn options(mut self, options: Options) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Parses and compiles the rules.
+    pub fn build(self) -> Result<Redactor, Error> {
+        let json_paths = self
+            .json
+            .iter()
+            .map(|r| r.parse())
+            .collect::<Result<Vec<JsonPath>, _>>()?;
+        let proto_paths = self
+            .proto
+            .iter()
+            .map(|r| r.parse())
+            .collect::<Result<Vec<FieldPath>, _>>()?;
+        let o = &self.options;
+        let compiled = Compiled {
+            json: Arc::new(json::Compiled::new(
+                json_paths,
+                o,
+                true,
+                o.preserve_json_size,
+            )?),
+            proto: Arc::new(proto::Compiled::new(proto_paths, o)),
+            form: Arc::new(form::Compiled::new(self.form, o)?),
+        };
+        Ok(Redactor { compiled })
+    }
+}
+
+/// Compiled redaction rules for every codec.
 ///
-/// Cheap to clone and safe to share between tasks; create one per
-/// (content type, rule set) and reuse it for every payload.
+/// Cheap to clone and safe to share between tasks: build one and reuse it for
+/// every payload. Each payload is redacted with its own optional content
+/// type; whatever that leaves open is detected from the payload itself.
 #[derive(Clone)]
 pub struct Redactor {
-    format: Format,
     compiled: Compiled,
 }
 
 impl std::fmt::Debug for Redactor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Redactor")
-            .field("format", &self.format)
-            .finish_non_exhaustive()
+        f.debug_struct("Redactor").finish_non_exhaustive()
     }
 }
 
 impl Redactor {
-    /// Builds a redactor for `content_type` with default [`Options`].
-    ///
-    /// Rules are parsed according to the format's [`Codec`]: JSONPath for
-    /// JSON, dotted field numbers for protobuf.
-    pub fn new<I, S>(content_type: &str, rules: I) -> Result<Self, Error>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        Self::with_options(content_type, rules, Options::default())
-    }
-
-    /// Like [`Redactor::new`] with explicit options.
-    pub fn with_options<I, S>(content_type: &str, rules: I, options: Options) -> Result<Self, Error>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        let format = Format::from_content_type(content_type)
-            .ok_or_else(|| Error::UnsupportedContentType(content_type.to_owned()))?;
-        Self::for_format(format, rules, options)
-    }
-
-    /// Builds a redactor for an explicit format.
-    pub fn for_format<I, S>(format: Format, rules: I, options: Options) -> Result<Self, Error>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        match format.codec() {
-            Codec::Json => {
-                let paths = rules
-                    .into_iter()
-                    .map(|r| r.as_ref().parse::<JsonPath>())
-                    .collect::<Result<Vec<_>, _>>()?;
-                Self::json(format, paths, options)
-            }
-            Codec::Proto => {
-                let paths = rules
-                    .into_iter()
-                    .map(|r| r.as_ref().parse::<FieldPath>())
-                    .collect::<Result<Vec<_>, _>>()?;
-                Self::protobuf(format, paths, options)
-            }
-        }
-    }
-
-    /// Builds a redactor from pre-parsed JSONPaths.
-    /// `format` must use [`Codec::Json`].
-    pub fn json(format: Format, paths: Vec<JsonPath>, options: Options) -> Result<Self, Error> {
-        if format.codec() != Codec::Json {
-            return Err(Error::InvalidOptions(format!(
-                "{format:?} is not a JSON format"
-            )));
-        }
-        let c = json::Compiled::new(
-            paths,
-            &options,
-            format == Format::JsonLines,
-            options.preserve_json_size,
-        )?;
-        Ok(Redactor {
-            format,
-            compiled: Compiled::Json(Arc::new(c)),
-        })
-    }
-
-    /// Builds a redactor from pre-parsed field paths.
-    /// `format` must use [`Codec::Proto`].
-    pub fn protobuf(
-        format: Format,
-        paths: Vec<FieldPath>,
-        options: Options,
-    ) -> Result<Self, Error> {
-        if format.codec() != Codec::Proto {
-            return Err(Error::InvalidOptions(format!(
-                "{format:?} is not a protobuf format"
-            )));
-        }
-        let c = proto::Compiled::new(paths, &options);
-        Ok(Redactor {
-            format,
-            compiled: Compiled::Proto(Arc::new(c)),
-        })
-    }
-
-    /// The format this redactor handles.
-    pub fn format(&self) -> Format {
-        self.format
-    }
-
-    /// Creates a fresh sans-IO redaction state machine for one payload.
-    ///
-    /// Output is a drop-in replacement for the input: sizes are preserved
-    /// wherever a length prefix requires it (protobuf, RPC envelopes).
-    pub fn stream(&self) -> StreamRedactor {
-        StreamRedactor {
-            kind: self.engine(false),
-        }
-    }
-
-    /// Creates a sans-IO redactor that builds a redacted copy of one payload
-    /// in an internal buffer.
-    ///
-    /// Because the copy is buffered, redaction is free to change sizes:
-    /// protobuf fields are removed outright, and JSON values (including
-    /// inside RPC envelopes) get the normal `json_replacement`, with length
-    /// prefixes patched afterwards.
-    pub fn redacted_copy(&self) -> RedactedCopy {
-        RedactedCopy {
-            kind: self.engine(true),
-            buf: Vec::new(),
-            error: None,
-            finished: false,
-        }
+    /// Starts building a redactor.
+    pub fn builder() -> RedactorBuilder {
+        RedactorBuilder::default()
     }
 
     /// Wraps `reader` so that reading from the result yields the original
     /// bytes, unmodified, while a redacted copy is built on the side.
-    pub fn tee<R: AsyncRead>(&self, reader: R) -> TeeReader<R> {
-        TeeReader::new(reader, self.redacted_copy())
-    }
-
-    fn engine(&self, resize: bool) -> Kind {
-        let enveloped = self.format.envelope().is_some();
-        let msg = match &self.compiled {
-            // Fixed-length envelopes need same-size JSON unless we can patch them.
-            Compiled::Json(c) => {
-                envelope::Msg::Json(json::Engine::new(c.clone(), enveloped && !resize))
-            }
-            Compiled::Proto(c) => envelope::Msg::Proto(proto::Engine::new(c.clone(), resize)),
-        };
-        match (self.format.envelope(), msg) {
-            (None, envelope::Msg::Json(e)) => Kind::Json(e),
-            (None, envelope::Msg::Proto(e)) => Kind::Proto(e),
-            (Some(p), msg) => {
-                let env = envelope::Engine::new(p, msg, resize);
-                if matches!(self.format, Format::GrpcWebText(_)) {
-                    Kind::Text(base64::Engine::new(env, resize))
-                } else {
-                    Kind::Envelope(env)
-                }
-            }
-        }
+    ///
+    /// `content_type` is the payload's `Content-Type`, if known.
+    pub fn tee<R: AsyncRead>(&self, reader: R, content_type: Option<&str>) -> TeeReader<R> {
+        TeeReader::new(reader, self.redacted_copy(content_type))
     }
 
     /// Wraps `reader` so that reading from the result yields redacted bytes.
-    pub fn reader<R: AsyncRead>(&self, reader: R) -> RedactReader<R> {
-        RedactReader::new(reader, self.stream())
+    ///
+    /// The output is a drop-in replacement for the input: sizes are preserved
+    /// wherever a length prefix requires it (protobuf, RPC frames).
+    pub fn reader<R: AsyncRead>(&self, reader: R, content_type: Option<&str>) -> RedactReader<R> {
+        RedactReader::new(reader, self.stream(content_type))
     }
 
     /// Copies `reader` to `writer`, redacting along the way.
     /// Returns the number of bytes written.
-    pub async fn redact<R, W>(&self, reader: R, writer: &mut W) -> std::io::Result<u64>
+    pub async fn redact<R, W>(
+        &self,
+        reader: R,
+        writer: &mut W,
+        content_type: Option<&str>,
+    ) -> std::io::Result<u64>
     where
         R: AsyncRead,
         W: AsyncWrite + Unpin + ?Sized,
     {
-        let mut reader = std::pin::pin!(self.reader(reader));
+        let mut reader = std::pin::pin!(self.reader(reader, content_type));
         tokio::io::copy(&mut reader, writer).await
+    }
+
+    /// Sans-IO version of [`reader`](Self::reader).
+    pub fn stream(&self, content_type: Option<&str>) -> StreamRedactor {
+        StreamRedactor {
+            engine: Auto::new(self.compiled.clone(), content_type, false),
+        }
+    }
+
+    /// Sans-IO version of [`tee`](Self::tee): builds a redacted copy of one
+    /// payload in an internal buffer.
+    ///
+    /// Because the copy is buffered, redaction is free to change sizes:
+    /// protobuf fields are removed outright, and JSON values (including
+    /// inside RPC frames) get the normal `json_replacement`, with length
+    /// prefixes patched afterwards.
+    pub fn redacted_copy(&self, content_type: Option<&str>) -> RedactedCopy {
+        RedactedCopy {
+            engine: Auto::new(self.compiled.clone(), content_type, true),
+            buf: Vec::new(),
+            error: None,
+            finished: false,
+        }
     }
 }
 
@@ -422,54 +307,9 @@ impl Redactor {
 ///
 /// Feed input chunks in order with [`feed`](Self::feed), then call
 /// [`finish`](Self::finish) once at end of input. Output is appended to the
-/// supplied buffer; each call produces output proportional to its input.
+/// supplied buffer.
 pub struct StreamRedactor {
-    kind: Kind,
-}
-
-enum Kind {
-    Json(json::Engine),
-    Proto(proto::Engine),
-    Envelope(envelope::Engine),
-    Text(base64::Engine),
-}
-
-impl Kind {
-    fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
-        match self {
-            Kind::Json(e) => e.feed(input, out),
-            Kind::Proto(e) => e.feed(input, out),
-            Kind::Envelope(e) => e.feed(input, out),
-            Kind::Text(e) => e.feed(input, out),
-        }
-    }
-
-    fn finish(&mut self, out: &mut Vec<u8>) -> Result<(), Error> {
-        match self {
-            Kind::Json(e) => e.finish(out),
-            Kind::Proto(e) => e.finish(out),
-            Kind::Envelope(e) => e.finish(out),
-            Kind::Text(e) => e.finish(out),
-        }
-    }
-
-    /// Length of the output prefix that will never be rewritten.
-    fn committed(&self, out_len: usize) -> usize {
-        match self {
-            Kind::Proto(e) => e.committed(out_len),
-            Kind::Envelope(e) => e.committed(out_len),
-            Kind::Json(_) | Kind::Text(_) => out_len,
-        }
-    }
-
-    /// `k` bytes were removed from the front of the output buffer.
-    fn shift(&mut self, k: usize) {
-        match self {
-            Kind::Proto(e) => e.shift(k),
-            Kind::Envelope(e) => e.shift(k),
-            Kind::Json(_) | Kind::Text(_) => {}
-        }
-    }
+    engine: Auto,
 }
 
 impl StreamRedactor {
@@ -478,13 +318,13 @@ impl StreamRedactor {
     /// After an error the state machine must not be used again. Output
     /// written so far is still safe: it never contains redacted data.
     pub fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
-        self.kind.feed(input, out)
+        self.engine.feed(input, out)
     }
 
     /// Signals end of input, flushing any held-back output. Fails if the
     /// input was truncated.
     pub fn finish(&mut self, out: &mut Vec<u8>) -> Result<(), Error> {
-        self.kind.finish(out)
+        self.engine.finish(out)
     }
 }
 
@@ -497,7 +337,7 @@ impl StreamRedactor {
 /// message for RPC envelopes, and the outermost open sub-message on a rule
 /// path for protobuf.
 pub struct RedactedCopy {
-    kind: Kind,
+    engine: Auto,
     buf: Vec<u8>,
     error: Option<Error>,
     finished: bool,
@@ -512,7 +352,7 @@ impl RedactedCopy {
             return Err(e.clone());
         }
         debug_assert!(!self.finished, "feed after finish");
-        self.kind
+        self.engine
             .feed(input, &mut self.buf)
             .inspect_err(|e| self.error = Some(e.clone()))
     }
@@ -522,10 +362,10 @@ impl RedactedCopy {
         let ready = if self.finished {
             self.buf.len()
         } else {
-            self.kind.committed(self.buf.len())
+            self.engine.committed(self.buf.len())
         };
         let rest = self.buf.split_off(ready);
-        self.kind.shift(ready);
+        self.engine.shift(ready);
         std::mem::replace(&mut self.buf, rest)
     }
 
@@ -547,7 +387,7 @@ impl RedactedCopy {
     fn end(&mut self) {
         if self.error.is_none() && !self.finished {
             self.finished = true;
-            if let Err(e) = self.kind.finish(&mut self.buf) {
+            if let Err(e) = self.engine.finish(&mut self.buf) {
                 self.error = Some(e);
             }
         }
@@ -555,69 +395,5 @@ impl RedactedCopy {
 
     fn error(&self) -> Option<&Error> {
         self.error.as_ref()
-    }
-}
-
-/// Convenience: build a redactor and wrap `reader` in one call.
-pub fn redact_reader<R, I, S>(
-    content_type: &str,
-    rules: I,
-    reader: R,
-) -> Result<RedactReader<R>, Error>
-where
-    R: AsyncRead,
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    Ok(Redactor::new(content_type, rules)?.reader(reader))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn content_types() {
-        use Codec::*;
-        let cases = [
-            ("application/json; charset=utf-8", Some(Format::Json)),
-            ("Application/Problem+JSON", Some(Format::Json)),
-            ("application/x-ndjson", Some(Format::JsonLines)),
-            ("application/x-protobuf", Some(Format::Protobuf)),
-            ("application/proto", Some(Format::Protobuf)),
-            ("application/vnd.foo+proto", Some(Format::Protobuf)),
-            ("application/grpc", Some(Format::Grpc(Proto))),
-            ("application/grpc+proto", Some(Format::Grpc(Proto))),
-            ("application/grpc+json", Some(Format::Grpc(Json))),
-            ("application/grpc-web", Some(Format::GrpcWeb(Proto))),
-            ("application/grpc-web+json", Some(Format::GrpcWeb(Json))),
-            (
-                "application/grpc-web-text",
-                Some(Format::GrpcWebText(Proto)),
-            ),
-            (
-                "application/grpc-web-text+proto",
-                Some(Format::GrpcWebText(Proto)),
-            ),
-            (
-                "application/grpc-web-text+json",
-                Some(Format::GrpcWebText(Json)),
-            ),
-            (
-                "application/connect+proto",
-                Some(Format::ConnectStream(Proto)),
-            ),
-            (
-                "application/connect+json",
-                Some(Format::ConnectStream(Json)),
-            ),
-            ("application/connect", None),
-            ("application/grpc+thrift", None),
-            ("application/grpc-web+flatbuffers", None),
-            ("text/plain", None),
-        ];
-        for (ct, want) in cases {
-            assert_eq!(Format::from_content_type(ct), want, "{ct}");
-        }
     }
 }

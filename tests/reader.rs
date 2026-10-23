@@ -2,7 +2,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use streaming_parse::{Redactor, redact_reader};
+use streaming_parse::Redactor;
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
 /// Yields its data a few bytes at a time, returning `Pending` in between.
@@ -44,12 +44,11 @@ impl AsyncRead for Trickle {
 #[tokio::test]
 async fn async_read_adapter() {
     let input = r#"{"user": {"email": "a@b.c", "password": "hunter2"}, "items": [{"card": "4111"}, {"card": "5500"}]}"#;
-    let mut r = redact_reader(
-        "application/json",
-        ["$..password", "$.items[*].card"],
-        Trickle::new(input),
-    )
-    .unwrap();
+    let mut r = Redactor::builder()
+        .json(["$..password", "$.items[*].card"])
+        .build()
+        .unwrap()
+        .reader(Trickle::new(input), Some("application/json"));
     let mut out = String::new();
     r.read_to_string(&mut out).await.unwrap();
     assert_eq!(
@@ -67,9 +66,11 @@ async fn large_input_with_small_reads() {
         input.push_str(item);
     }
     input.push_str("{}]");
-    let mut r = Redactor::new("application/json", ["$[*].secret"])
+    let mut r = Redactor::builder()
+        .json(["$[*].secret"])
+        .build()
         .unwrap()
-        .reader(input.as_bytes());
+        .reader(input.as_bytes(), Some("application/json"));
     let mut out = Vec::new();
     let mut buf = [0u8; 7];
     loop {
@@ -86,10 +87,10 @@ async fn large_input_with_small_reads() {
 
 #[tokio::test]
 async fn copy_to_writer() {
-    let redactor = Redactor::new("application/json", ["$.a"]).unwrap();
+    let redactor = Redactor::builder().json(["$.a"]).build().unwrap();
     let mut out = Vec::new();
     let n = redactor
-        .redact(&br#"{"a":1,"b":2}"#[..], &mut out)
+        .redact(&br#"{"a":1,"b":2}"#[..], &mut out, None)
         .await
         .unwrap();
     assert_eq!(out, br#"{"a":"[REDACTED]","b":2}"#);
@@ -99,9 +100,11 @@ async fn copy_to_writer() {
 #[tokio::test]
 async fn errors_after_safe_prefix() {
     let input = r#"{"ok": 1, "pw": "secret" oops}"#;
-    let mut r = Redactor::new("application/json", ["$.pw"])
+    let mut r = Redactor::builder()
+        .json(["$.pw"])
+        .build()
         .unwrap()
-        .reader(input.as_bytes());
+        .reader(input.as_bytes(), Some("application/json"));
     let mut out = Vec::new();
     let err = r.read_to_end(&mut out).await.unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -112,8 +115,8 @@ async fn errors_after_safe_prefix() {
 }
 
 #[test]
-fn rejects_unknown_content_type_and_bad_rules() {
-    assert!(Redactor::new("text/html", ["$.a"]).is_err());
-    assert!(Redactor::new("application/json", ["a.b"]).is_err());
-    assert!(Redactor::new("application/x-protobuf", ["$.a"]).is_err());
+fn rejects_bad_rules() {
+    assert!(Redactor::builder().json(["a.b"]).build().is_err());
+    assert!(Redactor::builder().proto(["$.a"]).build().is_err());
+    assert!(Redactor::builder().form([""]).build().is_err());
 }

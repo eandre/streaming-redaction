@@ -4,8 +4,9 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
-    /// The content type is not one this crate can redact.
-    UnsupportedContentType(String),
+    /// The payload isn't JSON, protobuf or a form (or not one this crate
+    /// can tell apart without a content type).
+    UnrecognizedPayload,
     /// A redaction rule could not be parsed.
     InvalidRule { rule: String, reason: String },
     /// The options are invalid (e.g. the JSON replacement is not valid JSON).
@@ -23,7 +24,12 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::UnsupportedContentType(ct) => write!(f, "unsupported content type {ct:?}"),
+            Error::UnrecognizedPayload => {
+                write!(
+                    f,
+                    "payload is not recognizable as JSON, protobuf or form data"
+                )
+            }
             Error::InvalidRule { rule, reason } => {
                 write!(f, "invalid redaction rule {rule:?}: {reason}")
             }

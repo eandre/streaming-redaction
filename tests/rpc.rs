@@ -41,6 +41,17 @@ fn frames(body: &[u8]) -> Vec<(u8, &[u8])> {
     out
 }
 
+/// A redactor with `rules` for the codec named by `ct`.
+fn build(ct: &str, rules: &[&str], opts: Options) -> Result<Redactor, Error> {
+    let b = Redactor::builder().options(opts);
+    if ct.contains("json") {
+        b.json(rules)
+    } else {
+        b.proto(rules)
+    }
+    .build()
+}
+
 /// Runs a redactor over `input` in chunks of `chunk` bytes.
 fn run(ct: &str, rules: &[&str], input: &[u8], chunk: usize) -> Result<Vec<u8>, Error> {
     run_opts(ct, rules, input, chunk, Options::default())
@@ -53,8 +64,8 @@ fn run_opts(
     chunk: usize,
     opts: Options,
 ) -> Result<Vec<u8>, Error> {
-    let r = Redactor::with_options(ct, rules, opts)?;
-    let mut s = r.stream();
+    let r = build(ct, rules, opts)?;
+    let mut s = r.stream(Some(ct));
     let mut out = Vec::new();
     for c in input.chunks(chunk.max(1)) {
         s.feed(c, &mut out)?;
@@ -175,14 +186,20 @@ fn grpc_web_text_padding_mid_stream() {
         "test needs mid-stream padding"
     );
 
-    let out = String::from_utf8(
-        run("application/grpc-web-text", &["2", "3"], text.as_bytes(), 5).unwrap(),
-    )
-    .unwrap();
-    // Padding lands in the same places.
     let pads = |s: &str| s.match_indices('=').map(|(i, _)| i).collect::<Vec<_>>();
-    assert_eq!(pads(&out), pads(&text));
-    check_redacted_logins(&b64_decode(&out), &msgs);
+    for ct in [
+        "application/grpc-web-text+proto",
+        "application/grpc-web-text",
+    ] {
+        let out = String::from_utf8(run(ct, &["2", "3"], text.as_bytes(), 5).unwrap()).unwrap();
+        // With a known codec, output keeps pace with input, so padding lands
+        // in the same places. Without one, the first message is held until
+        // its codec is detected, which shifts padding there.
+        if ct.ends_with("+proto") {
+            assert_eq!(pads(&out), pads(&text));
+        }
+        check_redacted_logins(&b64_decode(&out), &msgs);
+    }
 }
 
 #[test]
@@ -277,8 +294,8 @@ fn connect_end_stream_passes_through() {
 
 #[test]
 fn json_rules_for_json_codecs_field_numbers_for_proto() {
-    assert!(Redactor::new("application/grpc+json", ["2"]).is_err());
-    assert!(Redactor::new("application/grpc", ["$.password"]).is_err());
+    assert!(Redactor::builder().json(["2"]).build().is_err());
+    assert!(Redactor::builder().proto(["$.password"]).build().is_err());
 }
 
 #[test]

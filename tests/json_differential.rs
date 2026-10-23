@@ -2,7 +2,7 @@
 //! tree-based reference implementation written independently of it.
 
 use serde_json::{Map, Value};
-use streaming_parse::{Format, Options, Redactor};
+use streaming_parse::{Options, Redactor};
 
 struct Rng(u64);
 
@@ -214,9 +214,15 @@ fn differential(preserve_size: bool) {
         };
         let text = escape_keys(&text);
 
-        let redactor = Redactor::for_format(Format::Json, &rule_strs, opts.clone()).unwrap();
+        let redactor = Redactor::builder()
+            .json(&rule_strs)
+            .options(opts.clone())
+            .build()
+            .unwrap();
+        // Half the cases detect the codec from the payload.
+        let ct = (case % 2 == 0).then_some("application/json");
         let mut out = Vec::new();
-        let mut s = redactor.stream();
+        let mut s = redactor.stream(ct);
         let mut rest = text.as_bytes();
         while !rest.is_empty() {
             let n = (1 + rng.below(16) as usize).min(rest.len());

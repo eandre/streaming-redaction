@@ -1,5 +1,5 @@
 use prost::Message;
-use streaming_parse::{Codec, Error, Format, Options, ProtoFill, Redactor};
+use streaming_parse::{Error, Options, ProtoFill, Redactor};
 
 #[derive(Clone, PartialEq, Message)]
 struct User {
@@ -87,15 +87,15 @@ fn sample() -> User {
 }
 
 fn redact_with(rules: &[&str], input: &[u8], opts: Options) -> Result<Vec<u8>, Error> {
-    let r = Redactor::with_options("application/x-protobuf", rules, opts)?;
+    let r = Redactor::builder().proto(rules).options(opts).build()?;
 
     let mut whole = Vec::new();
-    let mut s = r.stream();
+    let mut s = r.stream(Some("application/x-protobuf"));
     let res = s.feed(input, &mut whole).and_then(|_| s.finish(&mut whole));
 
     // Byte-at-a-time feeding must produce identical output.
     let mut split = Vec::new();
-    let mut s = r.stream();
+    let mut s = r.stream(Some("application/x-protobuf"));
     let res2 = input
         .iter()
         .try_for_each(|b| s.feed(std::slice::from_ref(b), &mut split))
@@ -270,10 +270,10 @@ fn grpc_frame(flags: u8, msg: &[u8]) -> Vec<u8> {
     f
 }
 
-fn run_grpc(format: Format, rules: &[&str], input: &[u8]) -> Result<Vec<u8>, Error> {
-    let r = Redactor::for_format(format, rules, Options::default())?;
+fn run_grpc(ct: &str, rules: &[&str], input: &[u8]) -> Result<Vec<u8>, Error> {
+    let r = Redactor::builder().proto(rules).build()?;
     let mut out = Vec::new();
-    let mut s = r.stream();
+    let mut s = r.stream(Some(ct));
     for chunk in input.chunks(3) {
         s.feed(chunk, &mut out)?;
     }
@@ -293,7 +293,7 @@ fn grpc_framing() {
     body.extend(grpc_frame(0, &[]));
     body.extend(grpc_frame(0, &b));
 
-    let out = run_grpc(Format::Grpc(Codec::Proto), &["2"], &body).unwrap();
+    let out = run_grpc("application/grpc", &["2"], &body).unwrap();
     assert_eq!(out.len(), body.len());
     let m1 = User::decode(&out[5..5 + a.len()]).unwrap();
     let off = 5 + a.len() + 5;
@@ -303,11 +303,11 @@ fn grpc_framing() {
     assert_eq!(m2.password, "\0\0"); // too short for a filler chunk
 
     assert!(matches!(
-        run_grpc(Format::Grpc(Codec::Proto), &["2"], &grpc_frame(1, &a)),
+        run_grpc("application/grpc", &["2"], &grpc_frame(1, &a)),
         Err(Error::CompressedGrpcMessage { offset: 0 })
     ));
     assert!(matches!(
-        run_grpc(Format::Grpc(Codec::Proto), &["2"], &body[..body.len() - 1]),
+        run_grpc("application/grpc", &["2"], &body[..body.len() - 1]),
         Err(Error::UnexpectedEof { .. })
     ));
 }
@@ -318,7 +318,7 @@ fn grpc_web_trailers_pass_through() {
     let trailer = b"grpc-status:0\r\ngrpc-message:\r\n";
     let mut body = grpc_frame(0, &a);
     body.extend(grpc_frame(0x80, trailer));
-    let out = run_grpc(Format::GrpcWeb(Codec::Proto), &["4"], &body).unwrap();
+    let out = run_grpc("application/grpc-web", &["4"], &body).unwrap();
     assert!(out.ends_with(trailer));
     assert_eq!(
         User::decode(&out[5..5 + a.len()]).unwrap().address,
